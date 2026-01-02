@@ -22,6 +22,11 @@ let page = null;
 let captureProcess = null;
 let streamStatus = { active: false, error: null };
 
+// Helper function to replace deprecated waitForTimeout
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
@@ -121,7 +126,7 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
     });
 
     // Wait a bit for page to load
-    await page.waitForTimeout(2000);
+    await wait(2000);
 
     // Try to click play button
     try {
@@ -129,7 +134,7 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
       await page.waitForSelector(playButtonSelector, { timeout: 10000 });
       await page.click(playButtonSelector);
       console.log('Play button clicked successfully');
-      await page.waitForTimeout(1000); // Wait for audio to start
+      await wait(1000); // Wait for audio to start
     } catch (error) {
       console.warn(`Could not find/click play button with selector "${playButtonSelector}": ${error.message}`);
       console.log('Trying alternative: clicking on body to enable autoplay...');
@@ -137,7 +142,7 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
       await page.evaluate(() => {
         document.body.click();
       });
-      await page.waitForTimeout(1000);
+      await wait(1000);
     }
 
     // Get Chrome DevTools Protocol client
