@@ -243,6 +243,36 @@ async function startBrowserCapture(client) {
     everyNthFrame: Math.max(1, Math.floor(30 / FPS)) // Adjust based on FPS
   });
   
+  console.log('Screencast started, waiting for first frame...');
+  
+  // Wait for first frame before starting FFmpeg
+  let firstFrameReceived = false;
+  const firstFramePromise = new Promise((resolve) => {
+    const frameHandler = async (frame) => {
+      if (!firstFrameReceived) {
+        firstFrameReceived = true;
+        try {
+          const buffer = Buffer.from(frame.data, 'base64');
+          frameBuffer.push(buffer);
+          await client.send('Page.screencastFrameAck', { sessionId: frame.sessionId });
+          console.log('First frame received, starting FFmpeg...');
+          resolve();
+        } catch (error) {
+          console.error('Error processing first frame:', error);
+          resolve(); // Continue anyway
+        }
+      }
+    };
+    client.once('Page.screencastFrame', frameHandler);
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      if (!firstFrameReceived) {
+        console.warn('No frame received after 5 seconds, starting FFmpeg anyway...');
+        resolve();
+      }
+    }, 5000);
+  });
+  
   // Listen for screencast frames
   client.on('Page.screencastFrame', async (frame) => {
     if (!captureState.isCapturing) return;
@@ -259,8 +289,13 @@ async function startBrowserCapture(client) {
     }
   });
   
+  // Wait for first frame
+  await firstFramePromise;
+  
   // Start FFmpeg process to encode frames and stream
   console.log('Starting FFmpeg encoding process...');
+  console.log(`FFmpeg path: ${ffmpegStatic}`);
+  console.log(`RTMPS URL: ${RTMPS_URL}`);
   
   const ffmpegArgs = [
     '-f', 'image2pipe',
@@ -268,7 +303,7 @@ async function startBrowserCapture(client) {
     '-r', FPS.toString(),
     '-i', '-',
     '-f', 'lavfi',
-    '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050', // Silent audio source (we'll try to capture real audio if possible)
+    '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050',
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
@@ -290,6 +325,8 @@ async function startBrowserCapture(client) {
     RTMPS_URL
   ];
   
+  console.log('FFmpeg command:', ffmpegStatic, ffmpegArgs.join(' '));
+  
   captureProcess = spawn(ffmpegStatic, ffmpegArgs);
   
   // Handle stdin errors to prevent EPIPE crashes
@@ -301,6 +338,41 @@ async function startBrowserCapture(client) {
       // EPIPE is expected when FFmpeg closes, so we ignore it
     });
   }
+  
+  // Collect all stderr output for debugging
+  let ffmpegStderr = '';
+  
+  // Handle FFmpeg output
+  captureProcess.stderr.on('data', (data) => {
+    const output = data.toString();
+    ffmpegStderr += output;
+    // Log all FFmpeg output for debugging
+    if (output.trim()) {
+      console.log('FFmpeg:', output.trim());
+    }
+    if (output.includes('error') || output.includes('Error') || output.includes('failed')) {
+      console.error('FFmpeg error detected:', output);
+    }
+  });
+  
+  captureProcess.on('error', (error) => {
+    console.error('FFmpeg process error:', error);
+    streamStatus.active = false;
+    streamStatus.error = error.message;
+    captureState.isCapturing = false;
+  });
+  
+  captureProcess.on('exit', (code, signal) => {
+    console.log(`FFmpeg process exited with code ${code}, signal ${signal}`);
+    if (ffmpegStderr) {
+      console.log('FFmpeg stderr output:', ffmpegStderr);
+    }
+    captureState.isCapturing = false;
+    streamStatus.active = false;
+    if (code !== 0 && code !== null) {
+      streamStatus.error = `FFmpeg exited with code ${code}`;
+    }
+  });
   
   // Pipe frames to FFmpeg
   const sendFrames = () => {
@@ -336,28 +408,10 @@ async function startBrowserCapture(client) {
     }
   };
   
-  sendFrames();
-  
-  // Handle FFmpeg output
-  captureProcess.stderr.on('data', (data) => {
-    const output = data.toString();
-    if (output.includes('error') || output.includes('Error')) {
-      console.error('FFmpeg error:', output);
-    }
-  });
-  
-  captureProcess.on('error', (error) => {
-    console.error('FFmpeg process error:', error);
-    streamStatus.active = false;
-    streamStatus.error = error.message;
-    captureState.isCapturing = false;
-  });
-  
-  captureProcess.on('exit', (code) => {
-    console.log(`FFmpeg process exited with code ${code}`);
-    captureState.isCapturing = false;
-    streamStatus.active = false;
-  });
+  // Start sending frames after a small delay to ensure FFmpeg is ready
+  setTimeout(() => {
+    sendFrames();
+  }, 500);
   
   // Try to capture audio from the page
   // Note: This is a workaround - real audio capture from browser requires more complex setup
