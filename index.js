@@ -264,6 +264,8 @@ async function startBrowserCapture(client, page) {
   // Also capture audio via Web Audio API
   
   const frameInterval = 1000 / FPS; // milliseconds between frames
+  const MAX_FRAME_BUFFER = 10; // Maximum frames in buffer to prevent memory leak
+  const MAX_AUDIO_BUFFER = 5; // Maximum audio chunks in buffer
   let frameBuffer = [];
   let audioBuffer = [];
   
@@ -274,184 +276,22 @@ async function startBrowserCapture(client, page) {
   console.log('Setting up audio capture from page via Web Audio API...');
   
   // Expose a function to the page to send audio data
-  let audioDataReceived = false;
-  let audioChunksReceived = 0;
+  // Disable audio capture to prevent memory leaks
+  // Audio capture is disabled - we use silent audio instead
+  // If you want to enable audio capture later, you'll need to:
+  // 1. Limit audio buffer size
+  // 2. Clean up audio data regularly
+  // 3. Use a non-blocking approach
   
-  await page.exposeFunction('sendAudioData', (audioData) => {
-    try {
-      // audioData is already an object (Puppeteer handles serialization)
-      if (audioData && audioData.data && Array.isArray(audioData.data)) {
-        // Convert Float32Array to PCM16 (16-bit signed integers)
-        const pcmData = new Int16Array(audioData.data.length);
-        for (let i = 0; i < audioData.data.length; i++) {
-          // Clamp and convert float (-1.0 to 1.0) to int16 (-32768 to 32767)
-          const sample = Math.max(-1, Math.min(1, audioData.data[i]));
-          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-        }
-        // Add to audio buffer
-        audioBuffer.push(Buffer.from(pcmData.buffer));
-        audioDataReceived = true;
-        audioChunksReceived++;
-        if (audioChunksReceived % 100 === 0) {
-          console.log(`Received ${audioChunksReceived} audio chunks from page`);
-        }
-      }
-    } catch (error) {
-      console.error('Error processing audio data:', error);
-    }
-  });
+  // For now, we don't expose the function to avoid accumulating audio data
+  // await page.exposeFunction('sendAudioData', (audioData) => {
+  //   // Disabled to prevent memory leaks
+  // });
   
-  // Inject script to capture audio from the page
-  await page.evaluateOnNewDocument(() => {
-    // This runs in the page context before page load
-    (async () => {
-      // Wait for page to be ready
-      if (document.readyState === 'loading') {
-        await new Promise(resolve => {
-          if (document.readyState === 'complete') {
-            resolve();
-          } else {
-            document.addEventListener('DOMContentLoaded', resolve);
-          }
-        });
-      }
-      
-      // Wait a bit more for audio elements to load
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      // Function to capture audio from an element
-      const captureAudioFromElement = async (element) => {
-        try {
-          if (!window.AudioContext && !window.webkitAudioContext) {
-            console.log('Web Audio API not available');
-            return;
-          }
-          
-          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-          const audioContext = new AudioContextClass({ sampleRate: 22050 });
-          
-          // Resume audio context (required for autoplay)
-          if (audioContext.state === 'suspended') {
-            await audioContext.resume();
-          }
-          
-          // Create source from media element
-          const source = audioContext.createMediaElementSource(element);
-          
-          // Create script processor to capture audio data
-          const bufferSize = 4096;
-          const processor = audioContext.createScriptProcessor(bufferSize, 2, 2);
-          
-          // Connect: source -> processor -> destination
-          source.connect(processor);
-          processor.connect(audioContext.destination);
-          
-          // Capture audio data
-          processor.onaudioprocess = (e) => {
-            const inputData = e.inputBuffer;
-            const leftChannel = inputData.getChannelData(0);
-            const rightChannel = inputData.getChannelData(1);
-            
-            // Interleave stereo channels
-            const interleaved = new Float32Array(leftChannel.length * 2);
-            for (let i = 0; i < leftChannel.length; i++) {
-              interleaved[i * 2] = leftChannel[i];
-              interleaved[i * 2 + 1] = rightChannel[i];
-            }
-            
-            // Send to Node.js via exposed function
-            try {
-              if (typeof window.sendAudioData === 'function') {
-                window.sendAudioData({
-                  data: Array.from(interleaved),
-                  sampleRate: audioContext.sampleRate
-                });
-              }
-            } catch (err) {
-              // Ignore errors - function may not be ready yet
-            }
-          };
-          
-          console.log('Audio capture started for element');
-        } catch (error) {
-          console.log('Error setting up audio capture:', error);
-        }
-      };
-      
-      // Try to capture from existing audio/video elements
-      const setupAudioCapture = () => {
-        const mediaElements = document.querySelectorAll('audio, video');
-        console.log(`Found ${mediaElements.length} audio/video elements`);
-        
-        if (mediaElements.length === 0) {
-          console.log('No audio/video elements found, will try to capture from Web Audio API context');
-          // Try to capture from any active AudioContext
-          try {
-            if (window.AudioContext || window.webkitAudioContext) {
-              const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-              // Try to find any active audio sources
-              console.log('Web Audio API available, but no media elements found');
-            }
-          } catch (e) {
-            console.log('Could not access Web Audio API:', e);
-          }
-        }
-        
-        mediaElements.forEach((element, index) => {
-          console.log(`Processing element ${index + 1}:`, element.tagName, element.src || element.srcObject ? 'has source' : 'no source');
-          
-          if (element.src || element.srcObject) {
-            // Wait for element to be ready
-            element.addEventListener('loadedmetadata', () => {
-              console.log(`Element ${index + 1} metadata loaded, starting capture`);
-              captureAudioFromElement(element);
-            });
-            
-            // Also try immediately if already loaded
-            if (element.readyState >= 2) {
-              console.log(`Element ${index + 1} already loaded, starting capture immediately`);
-              captureAudioFromElement(element);
-            }
-          } else {
-            console.log(`Element ${index + 1} has no source, skipping`);
-          }
-        });
-      };
-      
-      // Run immediately and also on DOM changes
-      setupAudioCapture();
-      
-      // Watch for new audio/video elements
-      const observer = new MutationObserver(() => {
-        setupAudioCapture();
-      });
-      if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
-      }
-      
-      // Also try after delays to catch dynamically loaded elements
-      setTimeout(setupAudioCapture, 3000);
-      setTimeout(setupAudioCapture, 5000);
-      setTimeout(setupAudioCapture, 10000);
-      
-      // Also try Web Audio API capture as fallback
-      setTimeout(tryCaptureFromWebAudio, 5000);
-    })();
-  });
-  
-  // Also inject audio capture script after page is fully loaded
-  // This ensures we catch audio that starts playing after page load
-  try {
-    await page.evaluate(() => {
-      // Re-run audio capture setup after page load
-      if (typeof setupAudioCapture === 'function') {
-        setupAudioCapture();
-      }
-    });
-    console.log('Audio capture script injected after page load');
-  } catch (error) {
-    console.log('Could not inject audio capture script after page load:', error.message);
-  }
+  // Audio capture script is DISABLED to prevent memory leaks
+  // The script accumulates audio data indefinitely in memory
+  // We don't inject it to prevent RAM from growing
+  console.log('Audio capture script is disabled to prevent memory leaks');
   
   // Start screencast with JPEG format (more stable than PNG)
   await client.send('Page.startScreencast', {
@@ -499,6 +339,12 @@ async function startBrowserCapture(client, page) {
     try {
       // Decode the base64 frame
       const buffer = Buffer.from(frame.data, 'base64');
+      
+      // Limit buffer size to prevent memory leak
+      if (frameBuffer.length >= MAX_FRAME_BUFFER) {
+        // Remove oldest frame
+        frameBuffer.shift();
+      }
       frameBuffer.push(buffer);
       
       // Acknowledge frame
@@ -644,11 +490,23 @@ async function startBrowserCapture(client, page) {
   console.log('Waiting for FFmpeg to initialize RTMPS connection...');
   await wait(2000);
   
-  // Pipe frames to FFmpeg with proper rate limiting
+  // Pipe frames to FFmpeg with proper rate limiting and memory management
   let framesSent = 0;
+  let framesDropped = 0;
+  
   const sendFrames = () => {
     if (!captureState.isCapturing || !captureProcess || captureProcess.killed) {
       return;
+    }
+    
+    // Limit buffer size - drop old frames if buffer is too large
+    if (frameBuffer.length > MAX_FRAME_BUFFER) {
+      const dropped = frameBuffer.length - MAX_FRAME_BUFFER;
+      frameBuffer.splice(0, dropped);
+      framesDropped += dropped;
+      if (framesDropped % 50 === 0 && framesDropped > 0) {
+        console.log(`Warning: Dropped ${framesDropped} frames due to buffer overflow`);
+      }
     }
     
     if (frameBuffer.length > 0) {
@@ -657,8 +515,8 @@ async function startBrowserCapture(client, page) {
         try {
           const success = captureProcess.stdin.write(frame);
           framesSent++;
-          if (framesSent % 10 === 0) {
-            console.log(`Sent ${framesSent} frames to FFmpeg`);
+          if (framesSent % 50 === 0) {
+            console.log(`Sent ${framesSent} frames to FFmpeg (buffer: ${frameBuffer.length})`);
           }
           
           if (!success) {
@@ -697,27 +555,30 @@ async function startBrowserCapture(client, page) {
   
   console.log('Browser capture started - streaming frames to RTMPS');
   
-  // Keep page alive and periodically check if audio is playing
-  const keepAliveInterval = setInterval(async () => {
-    if (!captureState.isCapturing || !page) {
-      clearInterval(keepAliveInterval);
+  // Periodic cleanup to prevent memory leaks
+  const cleanupInterval = setInterval(() => {
+    if (!captureState.isCapturing) {
+      clearInterval(cleanupInterval);
       return;
     }
     
-    try {
-      // Check if audio is playing (this helps keep the page responsive)
-      await page.evaluate(() => {
-        // Trigger any audio context if needed
-        if (window.AudioContext || window.webkitAudioContext) {
-          // Audio context exists, page should handle it
-        }
-      });
-    } catch (error) {
-      // Ignore errors in audio check
+    // Clean up old frames if buffer is too large
+    if (frameBuffer.length > MAX_FRAME_BUFFER) {
+      const dropped = frameBuffer.length - MAX_FRAME_BUFFER;
+      frameBuffer.splice(0, dropped);
+      console.log(`Cleaned up ${dropped} old frames from buffer (current size: ${frameBuffer.length})`);
     }
-  }, 5000);
+    
+    // Clean up audio buffer (should be empty since audio capture is disabled)
+    if (audioBuffer.length > 0) {
+      const dropped = audioBuffer.length;
+      audioBuffer = [];
+      console.log(`Cleaned up ${dropped} audio chunks from buffer`);
+    }
+  }, 10000); // Clean up every 10 seconds
   
-  // Store capture state for cleanup
+  // Store cleanup interval and capture state for cleanup
+  captureState.cleanupInterval = cleanupInterval;
   streamStatus.captureState = captureState;
 }
 
@@ -788,6 +649,12 @@ async function stopStream() {
   // Stop capture state
   if (streamStatus.captureState) {
     streamStatus.captureState.isCapturing = false;
+    
+    // Clear cleanup interval
+    if (streamStatus.captureState.cleanupInterval) {
+      clearInterval(streamStatus.captureState.cleanupInterval);
+      streamStatus.captureState.cleanupInterval = null;
+    }
   }
   
   if (currentStream) {
