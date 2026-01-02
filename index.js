@@ -32,6 +32,31 @@ const WEB_PAGE_URL = process.env.WEB_PAGE_URL;
 const PLAY_BUTTON_SELECTOR = process.env.PLAY_BUTTON_SELECTOR || 'button[aria-label="Play"], button[aria-label="play"], button[aria-label*="play" i], .play-button, [class*="play"], button:has-text("Play")';
 const FPS = parseInt(process.env.FPS) || 3; // Default 3 FPS (between 1-5)
 
+// Try to start PulseAudio for audio capture (if available)
+try {
+  const { execSync } = require('child_process');
+  try {
+    execSync('which pulseaudio', { stdio: 'ignore' });
+    // Try to start PulseAudio in system mode if not running
+    try {
+      execSync('pulseaudio --check', { stdio: 'ignore' });
+      console.log('PulseAudio is running');
+    } catch (e) {
+      console.log('Starting PulseAudio...');
+      try {
+        execSync('pulseaudio --start --system=false --disallow-exit --exit-idle-time=-1', { stdio: 'ignore' });
+        console.log('PulseAudio started');
+      } catch (err) {
+        console.log('Could not start PulseAudio:', err.message);
+      }
+    }
+  } catch (e) {
+    // PulseAudio not available
+  }
+} catch (error) {
+  // Ignore
+}
+
 if (!RTMPS_URL) {
   console.error('RTMPS_URL environment variable is required');
   process.exit(1);
@@ -120,7 +145,7 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
   streamStatus.error = null;
 
   try {
-    // Launch browser
+    // Launch browser with audio capture support
     browser = await puppeteer.launch({
       headless: true,
       args: [
@@ -129,15 +154,19 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
-        '--window-size=1280,720',
-        '--autoplay-policy=no-user-gesture-required'
+        '--window-size=1920,1080',
+        '--autoplay-policy=no-user-gesture-required',
+        '--enable-features=UseChromeOSDirectVideoDecoder',
+        '--use-fake-ui-for-media-stream', // Allow audio capture
+        '--use-fake-device-for-media-stream',
+        '--allow-running-insecure-content'
       ]
     });
 
     page = await browser.newPage();
     
-    // Set viewport
-    await page.setViewport({ width: 1280, height: 720 });
+    // Set viewport to 1920x1080
+    await page.setViewport({ width: 1920, height: 1080 });
     
     // Navigate to page
     console.log(`Navigating to ${webPageUrl}...`);
@@ -230,9 +259,40 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
     await client.send('Runtime.enable');
     await client.send('DOM.enable');
     
+    // Try to enable audio capture via Web Audio API
+    console.log('Setting up audio capture...');
+    try {
+      // Inject script to capture audio from the page
+      await page.evaluate(() => {
+        // Create a script that captures audio from the page
+        if (window.AudioContext || window.webkitAudioContext) {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          const context = new AudioContextClass();
+          
+          // Try to capture audio from media elements
+          const audioElements = document.querySelectorAll('audio, video');
+          audioElements.forEach(element => {
+            if (element.src || element.srcObject) {
+              try {
+                const source = context.createMediaElementSource(element);
+                const analyser = context.createAnalyser();
+                source.connect(analyser);
+                analyser.connect(context.destination);
+                console.log('Audio capture setup for media element');
+              } catch (e) {
+                console.log('Could not capture audio from element:', e);
+              }
+            }
+          });
+        }
+      });
+    } catch (error) {
+      console.warn('Audio capture setup failed:', error.message);
+    }
+    
     // Start screen capture using CDP
     console.log('Starting screen capture via CDP...');
-    await startBrowserCapture(client);
+    await startBrowserCapture(client, page);
     
   } catch (error) {
     console.error('Error setting up web page stream:', error);
@@ -246,7 +306,7 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
   }
 }
 
-async function startBrowserCapture(client) {
+async function startBrowserCapture(client, page) {
   // Use Chrome's screencast API to capture frames
   // We'll capture frames and pipe them to FFmpeg
   
@@ -260,8 +320,8 @@ async function startBrowserCapture(client) {
   await client.send('Page.startScreencast', {
     format: 'jpeg',
     quality: 80,
-    maxWidth: 1280,
-    maxHeight: 720,
+    maxWidth: 1920,
+    maxHeight: 1080,
     everyNthFrame: Math.max(1, Math.floor(30 / FPS)) // Adjust based on FPS
   });
   
@@ -319,6 +379,23 @@ async function startBrowserCapture(client) {
   console.log(`FFmpeg path: ${ffmpegPath}`);
   console.log(`RTMPS URL: ${RTMPS_URL}`);
   
+  // Try to capture audio from PulseAudio (system audio)
+  // This will capture audio from the browser if PulseAudio is configured
+  let audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050'];
+  
+  // Check if we can use PulseAudio for audio capture
+  try {
+    const { execSync } = require('child_process');
+    // Check if pulseaudio is available
+    execSync('which pulseaudio', { stdio: 'ignore' });
+    console.log('PulseAudio detected, attempting to capture system audio...');
+    // Try to capture from PulseAudio monitor source (captures what's playing)
+    audioInputArgs = ['-f', 'pulse', '-i', 'default', '-ac', '2', '-ar', '22050'];
+  } catch (e) {
+    console.log('PulseAudio not available, using silent audio');
+    console.log('Note: To capture audio from your website, you may need to configure PulseAudio or use a different audio capture method.');
+  }
+  
   // Optimized configuration for RTMPS streaming
   // Simplified approach to avoid SIGSEGV crashes
   const ffmpegArgs = [
@@ -326,8 +403,7 @@ async function startBrowserCapture(client) {
     '-vcodec', 'mjpeg',
     '-framerate', FPS.toString(),
     '-i', '-',
-    '-f', 'lavfi',
-    '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050',
+    ...audioInputArgs,
     // Simplified filter chain - scale first, then format conversion
     '-vf', `scale=640:-1:flags=fast_bilinear,fps=${FPS},format=yuv420p`,
     '-c:v', 'libx264',

@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs-18_x", "ffmpeg"]
+nixPkgs = ["nodejs-18_x", "ffmpeg", "pulseaudio"]
 
 [phases.install]
 cmds = ["npm install"]
