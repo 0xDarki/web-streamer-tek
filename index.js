@@ -235,9 +235,10 @@ async function startBrowserCapture(client) {
   // Store reference for cleanup
   const captureState = { isCapturing: true };
   
-  // Start screencast
+  // Start screencast with JPEG format (more stable than PNG)
   await client.send('Page.startScreencast', {
-    format: 'png',
+    format: 'jpeg',
+    quality: 80,
     maxWidth: 1280,
     maxHeight: 720,
     everyNthFrame: Math.max(1, Math.floor(30 / FPS)) // Adjust based on FPS
@@ -299,7 +300,7 @@ async function startBrowserCapture(client) {
   
   const ffmpegArgs = [
     '-f', 'image2pipe',
-    '-vcodec', 'png',
+    '-vcodec', 'mjpeg', // Use MJPEG for JPEG frames
     '-r', FPS.toString(),
     '-i', '-',
     '-f', 'lavfi',
@@ -315,13 +316,20 @@ async function startBrowserCapture(client) {
     '-maxrate', '500k',
     '-bufsize', '1000k',
     '-r', FPS.toString(),
-    '-vf', `scale=640:-1,fps=${FPS}`,
+    '-vf', `scale=640:-1,fps=${FPS},format=yuv420p`, // Explicit format conversion
     '-c:a', 'aac',
     '-b:a', '64k',
     '-ar', '22050',
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
+    '-rtmp_live', 'live', // RTMP live mode
+    '-rtmp_conn', 'O:1', // RTMP connection options
+    '-timeout', '5000000', // 5 second timeout in microseconds
+    '-reconnect', '1',
+    '-reconnect_at_eof', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '2',
     RTMPS_URL
   ];
   
