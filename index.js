@@ -299,7 +299,7 @@ async function startBrowserCapture(client) {
   console.log(`RTMPS URL: ${RTMPS_URL}`);
   
   // Optimized configuration for RTMPS streaming
-  // Key changes: better format handling, proper RTMPS options
+  // Simplified approach to avoid SIGSEGV crashes
   const ffmpegArgs = [
     '-f', 'image2pipe',
     '-vcodec', 'mjpeg',
@@ -307,8 +307,8 @@ async function startBrowserCapture(client) {
     '-i', '-',
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050',
-    // Convert format properly - use swscale for better compatibility
-    '-vf', `format=yuv420p,scale=640:-1:flags=fast_bilinear,fps=${FPS}`,
+    // Simplified filter chain - scale first, then format conversion
+    '-vf', `scale=640:-1:flags=fast_bilinear,fps=${FPS},format=yuv420p`,
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
@@ -326,11 +326,10 @@ async function startBrowserCapture(client) {
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    // RTMPS specific options
+    // RTMPS/TLS options
     '-protocol_whitelist', 'file,http,https,tcp,tls,rtmp,rtmps',
-    '-rtmp_live', 'live',
-    '-rtmp_conn', 'O:1 NS:pub:stream',
-    '-loglevel', 'info', // Use info to see connection details
+    '-tls_verify', '0', // Disable TLS certificate verification (may help with connection issues)
+    '-loglevel', 'info',
     RTMPS_URL
   ];
   
