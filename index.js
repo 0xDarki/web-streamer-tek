@@ -1,6 +1,8 @@
 const express = require('express');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 
 // Try to use system FFmpeg first (if available via nixpacks), fallback to ffmpeg-static
@@ -259,12 +261,155 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
 async function startBrowserCapture(client, page) {
   // Use Chrome's screencast API to capture frames
   // We'll capture frames and pipe them to FFmpeg
+  // Also capture audio via Web Audio API
   
   const frameInterval = 1000 / FPS; // milliseconds between frames
   let frameBuffer = [];
+  let audioBuffer = [];
   
   // Store reference for cleanup
   const captureState = { isCapturing: true };
+  
+  // Set up audio capture via Web Audio API
+  console.log('Setting up audio capture from page via Web Audio API...');
+  
+  // Expose a function to the page to send audio data
+  await page.exposeFunction('sendAudioData', (audioData) => {
+    try {
+      // audioData is already an object (Puppeteer handles serialization)
+      if (audioData && audioData.data && Array.isArray(audioData.data)) {
+        // Convert Float32Array to PCM16 (16-bit signed integers)
+        const pcmData = new Int16Array(audioData.data.length);
+        for (let i = 0; i < audioData.data.length; i++) {
+          // Clamp and convert float (-1.0 to 1.0) to int16 (-32768 to 32767)
+          const sample = Math.max(-1, Math.min(1, audioData.data[i]));
+          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        }
+        // Add to audio buffer
+        audioBuffer.push(Buffer.from(pcmData.buffer));
+      }
+    } catch (error) {
+      console.error('Error processing audio data:', error);
+    }
+  });
+  
+  // Inject script to capture audio from the page
+  await page.evaluateOnNewDocument(() => {
+    // This runs in the page context before page load
+    (async () => {
+      // Wait for page to be ready
+      if (document.readyState === 'loading') {
+        await new Promise(resolve => {
+          if (document.readyState === 'complete') {
+            resolve();
+          } else {
+            document.addEventListener('DOMContentLoaded', resolve);
+          }
+        });
+      }
+      
+      // Wait a bit more for audio elements to load
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Function to capture audio from an element
+      const captureAudioFromElement = async (element) => {
+        try {
+          if (!window.AudioContext && !window.webkitAudioContext) {
+            console.log('Web Audio API not available');
+            return;
+          }
+          
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          const audioContext = new AudioContextClass({ sampleRate: 22050 });
+          
+          // Resume audio context (required for autoplay)
+          if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+          }
+          
+          // Create source from media element
+          const source = audioContext.createMediaElementSource(element);
+          
+          // Create script processor to capture audio data
+          const bufferSize = 4096;
+          const processor = audioContext.createScriptProcessor(bufferSize, 2, 2);
+          
+          // Connect: source -> processor -> destination
+          source.connect(processor);
+          processor.connect(audioContext.destination);
+          
+          // Capture audio data
+          processor.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer;
+            const leftChannel = inputData.getChannelData(0);
+            const rightChannel = inputData.getChannelData(1);
+            
+            // Interleave stereo channels
+            const interleaved = new Float32Array(leftChannel.length * 2);
+            for (let i = 0; i < leftChannel.length; i++) {
+              interleaved[i * 2] = leftChannel[i];
+              interleaved[i * 2 + 1] = rightChannel[i];
+            }
+            
+            // Send to Node.js via exposed function
+            try {
+              if (typeof window.sendAudioData === 'function') {
+                window.sendAudioData({
+                  data: Array.from(interleaved),
+                  sampleRate: audioContext.sampleRate
+                });
+              }
+            } catch (err) {
+              // Ignore errors - function may not be ready yet
+            }
+          };
+          
+          console.log('Audio capture started for element');
+        } catch (error) {
+          console.log('Error setting up audio capture:', error);
+        }
+      };
+      
+      // Try to capture from existing audio/video elements
+      const setupAudioCapture = () => {
+        const mediaElements = document.querySelectorAll('audio, video');
+        mediaElements.forEach(element => {
+          if (element.src || element.srcObject) {
+            // Wait for element to be ready
+            element.addEventListener('loadedmetadata', () => {
+              captureAudioFromElement(element);
+            });
+            
+            // Also try immediately if already loaded
+            if (element.readyState >= 2) {
+              captureAudioFromElement(element);
+            }
+          }
+        });
+      };
+      
+      // Run immediately and also on DOM changes
+      setupAudioCapture();
+      
+      // Watch for new audio/video elements
+      const observer = new MutationObserver(() => {
+        setupAudioCapture();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      
+      // Also try after a delay to catch dynamically loaded elements
+      setTimeout(setupAudioCapture, 3000);
+      setTimeout(setupAudioCapture, 5000);
+    })();
+  });
+  
+  // Also inject after page load
+  await page.evaluate(() => {
+    // Expose the binding function
+    if (window.chrome && window.chrome.runtime) {
+      // Already available via CDP binding
+    }
+  });
   
   // Start screencast with JPEG format (more stable than PNG)
   await client.send('Page.startScreencast', {
@@ -329,17 +474,40 @@ async function startBrowserCapture(client, page) {
   console.log(`FFmpeg path: ${ffmpegPath}`);
   console.log(`RTMPS URL: ${RTMPS_URL}`);
   
-  // Audio capture: On Railway, we can't easily capture system audio
-  // We'll use silent audio for now, but the page audio should be playing
-  // Note: To capture real audio, you would need to:
-  // 1. Use a virtual audio device (complex on Railway)
-  // 2. Intercept audio via Web Audio API and pipe to FFmpeg (very complex)
-  // 3. Use a service that can capture browser audio
-  // For now, we use silent audio as a placeholder
-  let audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050'];
+  // Set up audio capture via Web Audio API
+  // Create a named pipe (FIFO) for audio data
+  const audioPipePath = path.join('/tmp', `audio_${Date.now()}.pipe`);
+  let audioPipe = null;
+  let useAudioCapture = false;
   
-  console.log('Using silent audio (system audio capture not available on Railway)');
-  console.log('Note: Audio from your website is playing in the browser but cannot be captured in this headless environment.');
+  // Store pipe path for cleanup
+  streamStatus.audioPipePath = audioPipePath;
+  
+  try {
+    // Create named pipe for audio
+    execSync(`mkfifo ${audioPipePath}`, { stdio: 'ignore' });
+    audioPipe = fs.createWriteStream(audioPipePath);
+    useAudioCapture = true;
+    console.log('Audio pipe created:', audioPipePath);
+    console.log('Web Audio API capture will be used');
+    captureState.audioCapturing = true;
+  } catch (error) {
+    console.log('Could not create audio pipe, using silent audio:', error.message);
+    useAudioCapture = false;
+    streamStatus.audioPipePath = null;
+  }
+  
+  // Configure audio input for FFmpeg
+  let audioInputArgs;
+  if (useAudioCapture) {
+    // Use named pipe for audio (PCM 16-bit little-endian, 22050 Hz, stereo)
+    audioInputArgs = ['-f', 's16le', '-ar', '22050', '-ac', '2', '-i', audioPipePath];
+    console.log('FFmpeg will read audio from pipe:', audioPipePath);
+  } else {
+    // Fallback to silent audio
+    audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050'];
+    console.log('Using silent audio (fallback)');
+  }
   
   // Optimized configuration for RTMPS streaming
   // Simplified approach to avoid SIGSEGV crashes
@@ -378,6 +546,38 @@ async function startBrowserCapture(client, page) {
   console.log('FFmpeg command:', ffmpegPath, ffmpegArgs.join(' '));
   
   captureProcess = spawn(ffmpegPath, ffmpegArgs);
+  
+  // If using audio capture, write audio data to the named pipe
+  if (useAudioCapture && audioPipe) {
+    console.log('Starting audio capture writer to pipe...');
+    const writeAudio = () => {
+      if (!captureState.isCapturing || !audioPipe) return;
+      
+      if (audioBuffer.length > 0) {
+        const audioChunk = audioBuffer.shift();
+        try {
+          if (audioPipe && !audioPipe.destroyed) {
+            audioPipe.write(audioChunk, (error) => {
+              if (error && error.code !== 'EPIPE' && error.code !== 'ENOENT') {
+                console.error('Error writing audio to pipe:', error);
+              }
+            });
+          }
+        } catch (error) {
+          if (error.code !== 'EPIPE' && error.code !== 'ENOENT') {
+            console.error('Error writing audio:', error);
+          }
+        }
+      }
+      
+      if (captureState.isCapturing) {
+        setTimeout(writeAudio, 10); // Write audio every 10ms
+      }
+    };
+    
+    // Start writing audio after a delay to let FFmpeg open the pipe
+    setTimeout(writeAudio, 2000);
+  }
   
   // Handle stdin errors to prevent EPIPE crashes
   if (captureProcess.stdin) {
