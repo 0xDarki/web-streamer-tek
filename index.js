@@ -1,12 +1,8 @@
 const express = require('express');
-const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const puppeteer = require('puppeteer');
 const { spawn } = require('child_process');
 const app = express();
-
-// Configure FFmpeg path
-ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const PORT = process.env.PORT || 3000;
 const RTMPS_URL = process.env.RTMPS_URL;
@@ -316,56 +312,58 @@ function startStream(sourceUrl) {
   streamStatus.error = null;
 
   // Optimized FFmpeg command for low resource usage
-  currentStream = ffmpeg(sourceUrl)
-    .inputOptions([
-      '-re', // Read input at native frame rate
-      '-rtsp_transport', 'tcp', // Use TCP for RTSP if applicable
-      '-fflags', 'nobuffer', // Reduce buffering
-      '-flags', 'low_delay', // Low latency
-      '-strict', 'experimental'
-    ])
-    .videoCodec('libx264')
-    .videoFilters([
-      `fps=${FPS}`, // Set FPS to 1-5
-      'scale=640:-1' // Scale down to reduce bandwidth (optional, can be adjusted)
-    ])
-    .outputOptions([
-      '-preset', 'ultrafast', // Fastest encoding (lowest CPU)
-      '-tune', 'zerolatency', // Zero latency
-      '-profile:v', 'baseline', // Baseline profile (most compatible, lighter)
-      '-level', '3.0', // H.264 level
-      '-pix_fmt', 'yuv420p', // Pixel format
-      '-g', '10', // GOP size (keyframe interval)
-      '-b:v', '500k', // Video bitrate (low for resource efficiency)
-      '-maxrate', '500k',
-      '-bufsize', '1000k',
-      '-r', FPS.toString(), // Output frame rate
-      '-f', 'flv', // FLV format for RTMPS
-      '-flvflags', 'no_duration_filesize' // Optimize FLV
-    ])
-    .audioCodec('aac')
-    .audioOptions([
-      '-b:a', '64k', // Low audio bitrate
-      '-ar', '22050', // Lower sample rate (lighter)
-      '-ac', '2' // Stereo
-    ])
-    .output(RTMPS_URL)
-    .on('start', (commandLine) => {
-      console.log('FFmpeg command: ' + commandLine);
-    })
-    .on('error', (err, stdout, stderr) => {
-      console.error('FFmpeg error:', err.message);
-      console.error('FFmpeg stderr:', stderr);
-      streamStatus.active = false;
-      streamStatus.error = err.message;
-      currentStream = null;
-    })
-    .on('end', () => {
-      console.log('Stream ended');
-      streamStatus.active = false;
-      currentStream = null;
-    })
-    .run();
+  const ffmpegArgs = [
+    '-re', // Read input at native frame rate
+    '-rtsp_transport', 'tcp', // Use TCP for RTSP if applicable
+    '-fflags', 'nobuffer', // Reduce buffering
+    '-flags', 'low_delay', // Low latency
+    '-strict', 'experimental',
+    '-i', sourceUrl, // Input source
+    '-c:v', 'libx264', // Video codec
+    '-vf', `fps=${FPS},scale=640:-1`, // Video filters: FPS and scale
+    '-preset', 'ultrafast', // Fastest encoding (lowest CPU)
+    '-tune', 'zerolatency', // Zero latency
+    '-profile:v', 'baseline', // Baseline profile (most compatible, lighter)
+    '-level', '3.0', // H.264 level
+    '-pix_fmt', 'yuv420p', // Pixel format
+    '-g', '10', // GOP size (keyframe interval)
+    '-b:v', '500k', // Video bitrate (low for resource efficiency)
+    '-maxrate', '500k',
+    '-bufsize', '1000k',
+    '-r', FPS.toString(), // Output frame rate
+    '-c:a', 'aac', // Audio codec
+    '-b:a', '64k', // Low audio bitrate
+    '-ar', '22050', // Lower sample rate (lighter)
+    '-ac', '2', // Stereo
+    '-f', 'flv', // FLV format for RTMPS
+    '-flvflags', 'no_duration_filesize', // Optimize FLV
+    RTMPS_URL // Output URL
+  ];
+
+  console.log('FFmpeg command: ' + ffmpegStatic + ' ' + ffmpegArgs.join(' '));
+  
+  currentStream = spawn(ffmpegStatic, ffmpegArgs);
+  
+  // Handle FFmpeg output
+  currentStream.stderr.on('data', (data) => {
+    const output = data.toString();
+    if (output.includes('error') || output.includes('Error')) {
+      console.error('FFmpeg error:', output);
+    }
+  });
+  
+  currentStream.on('error', (error) => {
+    console.error('FFmpeg process error:', error);
+    streamStatus.active = false;
+    streamStatus.error = error.message;
+    currentStream = null;
+  });
+  
+  currentStream.on('exit', (code) => {
+    console.log(`FFmpeg process exited with code ${code}`);
+    streamStatus.active = false;
+    currentStream = null;
+  });
 }
 
 async function stopStream() {

@@ -119,6 +119,7 @@ npm start
 ## Notes
 
 - L'application utilise `ffmpeg-static` pour inclure FFmpeg sans installation système
+- Utilise directement FFmpeg via `spawn` (pas de dépendance dépréciée)
 - Le stream est optimisé pour être fluide avec une latence minimale
 - La consommation de ressources est minimisée grâce aux paramètres FFmpeg optimisés
 - Pour le streaming depuis une page web, l'application utilise Puppeteer pour contrôler un navigateur headless
