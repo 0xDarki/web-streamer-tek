@@ -6,13 +6,17 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const RTMPS_URL = process.env.RTMPS_URL;
+const RTMP_URL = process.env.RTMP_URL; // Fallback to RTMP if RTMPS doesn't work
 const SOURCE_URL = process.env.SOURCE_URL;
 const WEB_PAGE_URL = process.env.WEB_PAGE_URL;
 const PLAY_BUTTON_SELECTOR = process.env.PLAY_BUTTON_SELECTOR || 'button[aria-label="Play"], button[aria-label="play"], button[aria-label*="play" i], .play-button, [class*="play"], button:has-text("Play")';
 const FPS = parseInt(process.env.FPS) || 3; // Default 3 FPS (between 1-5)
 
-if (!RTMPS_URL) {
-  console.error('RTMPS_URL environment variable is required');
+// Determine which URL to use (RTMPS preferred, RTMP as fallback)
+const STREAM_URL = RTMPS_URL || RTMP_URL;
+
+if (!STREAM_URL) {
+  console.error('RTMPS_URL or RTMP_URL environment variable is required');
   process.exit(1);
 }
 
@@ -92,7 +96,7 @@ app.get('/status', (req, res) => {
 });
 
 async function startWebPageStream(webPageUrl, playButtonSelector) {
-  console.log(`Starting web page stream from ${webPageUrl} to ${RTMPS_URL} at ${FPS} FPS`);
+  console.log(`Starting web page stream from ${webPageUrl} to ${STREAM_URL} at ${FPS} FPS`);
   console.log(`Looking for play button with selector: ${playButtonSelector}`);
   
   streamStatus.active = true;
@@ -296,12 +300,14 @@ async function startBrowserCapture(client) {
   // Start FFmpeg process to encode frames and stream
   console.log('Starting FFmpeg encoding process...');
   console.log(`FFmpeg path: ${ffmpegStatic}`);
-  console.log(`RTMPS URL: ${RTMPS_URL}`);
+  console.log(`Stream URL: ${STREAM_URL}`);
   
+  // For RTMPS, use simple approach - FFmpeg should handle RTMPS automatically
+  // If RTMPS doesn't work, the issue might be with the FFmpeg build
   const ffmpegArgs = [
     '-f', 'image2pipe',
-    '-vcodec', 'mjpeg', // Use MJPEG for JPEG frames
-    '-r', FPS.toString(),
+    '-vcodec', 'mjpeg',
+    '-framerate', FPS.toString(), // Use framerate instead of -r for input
     '-i', '-',
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050',
@@ -315,22 +321,16 @@ async function startBrowserCapture(client) {
     '-b:v', '500k',
     '-maxrate', '500k',
     '-bufsize', '1000k',
-    '-r', FPS.toString(),
-    '-vf', `scale=640:-1,fps=${FPS},format=yuv420p`, // Explicit format conversion
+    '-r', FPS.toString(), // Output frame rate
+    '-vf', `scale=640:-1,fps=${FPS},format=yuv420p`,
     '-c:a', 'aac',
     '-b:a', '64k',
     '-ar', '22050',
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    '-rtmp_live', 'live', // RTMP live mode
-    '-rtmp_conn', 'O:1', // RTMP connection options
-    '-timeout', '5000000', // 5 second timeout in microseconds
-    '-reconnect', '1',
-    '-reconnect_at_eof', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '2',
-    RTMPS_URL
+    '-protocol_whitelist', 'file,http,https,tcp,tls,rtmp,rtmps', // Whitelist RTMPS protocol
+    STREAM_URL
   ];
   
   console.log('FFmpeg command:', ffmpegStatic, ffmpegArgs.join(' '));
@@ -453,7 +453,7 @@ async function startBrowserCapture(client) {
 }
 
 function startStream(sourceUrl) {
-  console.log(`Starting stream from ${sourceUrl} to ${RTMPS_URL} at ${FPS} FPS`);
+  console.log(`Starting stream from ${sourceUrl} to ${STREAM_URL} at ${FPS} FPS`);
   
   streamStatus.active = true;
   streamStatus.error = null;
@@ -482,9 +482,9 @@ function startStream(sourceUrl) {
     '-b:a', '64k', // Low audio bitrate
     '-ar', '22050', // Lower sample rate (lighter)
     '-ac', '2', // Stereo
-    '-f', 'flv', // FLV format for RTMPS
+    '-f', 'flv', // FLV format for RTMPS/RTMP
     '-flvflags', 'no_duration_filesize', // Optimize FLV
-    RTMPS_URL // Output URL
+    STREAM_URL // Output URL
   ];
 
   console.log('FFmpeg command: ' + ffmpegStatic + ' ' + ffmpegArgs.join(' '));
@@ -593,7 +593,7 @@ if (WEB_PAGE_URL) {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`RTMPS URL: ${RTMPS_URL}`);
+  console.log(`Stream URL: ${STREAM_URL}`);
   console.log(`Target FPS: ${FPS}`);
 });
 
