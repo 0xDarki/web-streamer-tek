@@ -126,23 +126,79 @@ async function startWebPageStream(webPageUrl, playButtonSelector) {
     });
 
     // Wait a bit for page to load
-    await wait(2000);
+    await wait(3000);
 
-    // Try to click play button
-    try {
-      console.log(`Looking for play button...`);
-      await page.waitForSelector(playButtonSelector, { timeout: 10000 });
-      await page.click(playButtonSelector);
-      console.log('Play button clicked successfully');
-      await wait(1000); // Wait for audio to start
-    } catch (error) {
-      console.warn(`Could not find/click play button with selector "${playButtonSelector}": ${error.message}`);
-      console.log('Trying alternative: clicking on body to enable autoplay...');
-      // Try clicking on body to enable autoplay
-      await page.evaluate(() => {
-        document.body.click();
-      });
-      await wait(1000);
+    // Try to click play button with multiple strategies
+    let playClicked = false;
+    
+    // Split selector string and try each one
+    const selectors = playButtonSelector.split(',').map(s => s.trim());
+    
+    for (const selector of selectors) {
+      try {
+        console.log(`Trying selector: ${selector}`);
+        await page.waitForSelector(selector, { timeout: 5000 });
+        await page.click(selector);
+        console.log(`Play button clicked successfully with selector: ${selector}`);
+        playClicked = true;
+        await wait(1000); // Wait for audio to start
+        break;
+      } catch (error) {
+        console.log(`Selector "${selector}" not found, trying next...`);
+        continue;
+      }
+    }
+    
+    // If no selector worked, try alternative methods
+    if (!playClicked) {
+      console.log('No play button found with selectors, trying alternative methods...');
+      
+      // Try to find any button with "play" in text or aria-label
+      try {
+        const playButton = await page.evaluate(() => {
+          // Try to find button by text content
+          const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+          for (const btn of buttons) {
+            const text = btn.textContent?.toLowerCase() || '';
+            const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || '';
+            if (text.includes('play') || ariaLabel.includes('play')) {
+              return true;
+            }
+          }
+          return false;
+        });
+        
+        if (playButton) {
+          await page.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+            for (const btn of buttons) {
+              const text = btn.textContent?.toLowerCase() || '';
+              const ariaLabel = btn.getAttribute('aria-label')?.toLowerCase() || '';
+              if (text.includes('play') || ariaLabel.includes('play')) {
+                btn.click();
+                return;
+              }
+            }
+          });
+          console.log('Play button clicked via JavaScript evaluation');
+          await wait(1000);
+        } else {
+          // Last resort: click on body to enable autoplay
+          console.log('Clicking on body to enable autoplay...');
+          await page.evaluate(() => {
+            document.body.click();
+            // Also try to trigger any audio context
+            if (window.AudioContext || window.webkitAudioContext) {
+              const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+              const context = new AudioContextClass();
+              context.resume();
+            }
+          });
+          await wait(1000);
+        }
+      } catch (error) {
+        console.warn('Alternative play button methods failed:', error.message);
+      }
     }
 
     // Get Chrome DevTools Protocol client
@@ -236,6 +292,16 @@ async function startBrowserCapture(client) {
   
   captureProcess = spawn(ffmpegStatic, ffmpegArgs);
   
+  // Handle stdin errors to prevent EPIPE crashes
+  if (captureProcess.stdin) {
+    captureProcess.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') {
+        console.error('FFmpeg stdin error:', error);
+      }
+      // EPIPE is expected when FFmpeg closes, so we ignore it
+    });
+  }
+  
   // Pipe frames to FFmpeg
   const sendFrames = () => {
     if (!captureState.isCapturing || !captureProcess || captureProcess.killed) return;
@@ -244,9 +310,23 @@ async function startBrowserCapture(client) {
       const frame = frameBuffer.shift();
       if (captureProcess.stdin && !captureProcess.stdin.destroyed) {
         try {
-          captureProcess.stdin.write(frame);
+          const success = captureProcess.stdin.write(frame);
+          if (!success) {
+            // Wait for drain if buffer is full
+            captureProcess.stdin.once('drain', () => {
+              if (captureState.isCapturing) {
+                setTimeout(sendFrames, frameInterval);
+              }
+            });
+            return;
+          }
         } catch (error) {
-          console.error('Error writing frame to FFmpeg:', error);
+          // EPIPE is expected when FFmpeg closes, ignore it
+          if (error.code !== 'EPIPE') {
+            console.error('Error writing frame to FFmpeg:', error);
+          }
+          captureState.isCapturing = false;
+          return;
         }
       }
     }
