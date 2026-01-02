@@ -274,6 +274,9 @@ async function startBrowserCapture(client, page) {
   console.log('Setting up audio capture from page via Web Audio API...');
   
   // Expose a function to the page to send audio data
+  let audioDataReceived = false;
+  let audioChunksReceived = 0;
+  
   await page.exposeFunction('sendAudioData', (audioData) => {
     try {
       // audioData is already an object (Puppeteer handles serialization)
@@ -287,6 +290,11 @@ async function startBrowserCapture(client, page) {
         }
         // Add to audio buffer
         audioBuffer.push(Buffer.from(pcmData.buffer));
+        audioDataReceived = true;
+        audioChunksReceived++;
+        if (audioChunksReceived % 100 === 0) {
+          console.log(`Received ${audioChunksReceived} audio chunks from page`);
+        }
       }
     } catch (error) {
       console.error('Error processing audio data:', error);
@@ -373,17 +381,39 @@ async function startBrowserCapture(client, page) {
       // Try to capture from existing audio/video elements
       const setupAudioCapture = () => {
         const mediaElements = document.querySelectorAll('audio, video');
-        mediaElements.forEach(element => {
+        console.log(`Found ${mediaElements.length} audio/video elements`);
+        
+        if (mediaElements.length === 0) {
+          console.log('No audio/video elements found, will try to capture from Web Audio API context');
+          // Try to capture from any active AudioContext
+          try {
+            if (window.AudioContext || window.webkitAudioContext) {
+              const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+              // Try to find any active audio sources
+              console.log('Web Audio API available, but no media elements found');
+            }
+          } catch (e) {
+            console.log('Could not access Web Audio API:', e);
+          }
+        }
+        
+        mediaElements.forEach((element, index) => {
+          console.log(`Processing element ${index + 1}:`, element.tagName, element.src || element.srcObject ? 'has source' : 'no source');
+          
           if (element.src || element.srcObject) {
             // Wait for element to be ready
             element.addEventListener('loadedmetadata', () => {
+              console.log(`Element ${index + 1} metadata loaded, starting capture`);
               captureAudioFromElement(element);
             });
             
             // Also try immediately if already loaded
             if (element.readyState >= 2) {
+              console.log(`Element ${index + 1} already loaded, starting capture immediately`);
               captureAudioFromElement(element);
             }
+          } else {
+            console.log(`Element ${index + 1} has no source, skipping`);
           }
         });
       };
@@ -395,21 +425,33 @@ async function startBrowserCapture(client, page) {
       const observer = new MutationObserver(() => {
         setupAudioCapture();
       });
-      observer.observe(document.body, { childList: true, subtree: true });
+      if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+      }
       
-      // Also try after a delay to catch dynamically loaded elements
+      // Also try after delays to catch dynamically loaded elements
       setTimeout(setupAudioCapture, 3000);
       setTimeout(setupAudioCapture, 5000);
+      setTimeout(setupAudioCapture, 10000);
+      
+      // Also try Web Audio API capture as fallback
+      setTimeout(tryCaptureFromWebAudio, 5000);
     })();
   });
   
-  // Also inject after page load
-  await page.evaluate(() => {
-    // Expose the binding function
-    if (window.chrome && window.chrome.runtime) {
-      // Already available via CDP binding
-    }
-  });
+  // Also inject audio capture script after page is fully loaded
+  // This ensures we catch audio that starts playing after page load
+  try {
+    await page.evaluate(() => {
+      // Re-run audio capture setup after page load
+      if (typeof setupAudioCapture === 'function') {
+        setupAudioCapture();
+      }
+    });
+    console.log('Audio capture script injected after page load');
+  } catch (error) {
+    console.log('Could not inject audio capture script after page load:', error.message);
+  }
   
   // Start screencast with JPEG format (more stable than PNG)
   await client.send('Page.startScreencast', {
@@ -475,38 +517,33 @@ async function startBrowserCapture(client, page) {
   console.log(`RTMPS URL: ${RTMPS_URL}`);
   
   // Set up audio capture via Web Audio API
-  // Create a named pipe (FIFO) for audio data
+  // For now, use silent audio by default to avoid FFmpeg blocking
+  // Audio capture from page can be added later if needed
+  // The issue is that FFmpeg blocks if the audio pipe is empty
+  
+  // Create a named pipe (FIFO) for audio data (for future use)
   const audioPipePath = path.join('/tmp', `audio_${Date.now()}.pipe`);
   let audioPipe = null;
   let useAudioCapture = false;
   
   // Store pipe path for cleanup
-  streamStatus.audioPipePath = audioPipePath;
+  streamStatus.audioPipePath = null; // Don't use pipe for now to avoid blocking
   
+  // For now, always use silent audio to ensure video streams properly
+  // Audio capture from page requires more complex setup to avoid blocking
+  let audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050'];
+  console.log('Using silent audio (audio capture from page requires additional setup to avoid FFmpeg blocking)');
+  
+  // Optional: Try to set up audio pipe for future use (but don't use it in FFmpeg yet)
   try {
-    // Create named pipe for audio
     execSync(`mkfifo ${audioPipePath}`, { stdio: 'ignore' });
-    audioPipe = fs.createWriteStream(audioPipePath);
-    useAudioCapture = true;
-    console.log('Audio pipe created:', audioPipePath);
-    console.log('Web Audio API capture will be used');
+    audioPipe = fs.createWriteStream(audioPipePath, { flags: 'w' });
+    console.log('Audio pipe created for future use:', audioPipePath);
     captureState.audioCapturing = true;
+    // Store path but don't use it in FFmpeg to avoid blocking
+    streamStatus.audioPipePath = audioPipePath;
   } catch (error) {
-    console.log('Could not create audio pipe, using silent audio:', error.message);
-    useAudioCapture = false;
-    streamStatus.audioPipePath = null;
-  }
-  
-  // Configure audio input for FFmpeg
-  let audioInputArgs;
-  if (useAudioCapture) {
-    // Use named pipe for audio (PCM 16-bit little-endian, 22050 Hz, stereo)
-    audioInputArgs = ['-f', 's16le', '-ar', '22050', '-ac', '2', '-i', audioPipePath];
-    console.log('FFmpeg will read audio from pipe:', audioPipePath);
-  } else {
-    // Fallback to silent audio
-    audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050'];
-    console.log('Using silent audio (fallback)');
+    // Ignore - we're using silent audio anyway
   }
   
   // Optimized configuration for RTMPS streaming
@@ -547,37 +584,11 @@ async function startBrowserCapture(client, page) {
   
   captureProcess = spawn(ffmpegPath, ffmpegArgs);
   
-  // If using audio capture, write audio data to the named pipe
-  if (useAudioCapture && audioPipe) {
-    console.log('Starting audio capture writer to pipe...');
-    const writeAudio = () => {
-      if (!captureState.isCapturing || !audioPipe) return;
-      
-      if (audioBuffer.length > 0) {
-        const audioChunk = audioBuffer.shift();
-        try {
-          if (audioPipe && !audioPipe.destroyed) {
-            audioPipe.write(audioChunk, (error) => {
-              if (error && error.code !== 'EPIPE' && error.code !== 'ENOENT') {
-                console.error('Error writing audio to pipe:', error);
-              }
-            });
-          }
-        } catch (error) {
-          if (error.code !== 'EPIPE' && error.code !== 'ENOENT') {
-            console.error('Error writing audio:', error);
-          }
-        }
-      }
-      
-      if (captureState.isCapturing) {
-        setTimeout(writeAudio, 10); // Write audio every 10ms
-      }
-    };
-    
-    // Start writing audio after a delay to let FFmpeg open the pipe
-    setTimeout(writeAudio, 2000);
-  }
+  // Audio capture from page is disabled for now to avoid FFmpeg blocking
+  // FFmpeg uses silent audio (anullsrc) so video can stream properly
+  // Audio capture can be re-enabled later with proper non-blocking setup
+  console.log('Audio capture from page is disabled - using silent audio to ensure video streams');
+  console.log('Note: Video should now stream properly. Audio capture requires additional setup.');
   
   // Handle stdin errors to prevent EPIPE crashes
   if (captureProcess.stdin) {
