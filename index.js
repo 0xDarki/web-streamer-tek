@@ -1,8 +1,29 @@
 const express = require('express');
-const ffmpegStatic = require('ffmpeg-static');
-const puppeteer = require('puppeteer');
 const { spawn } = require('child_process');
+const puppeteer = require('puppeteer');
 const app = express();
+
+// Try to use system FFmpeg first (if available via nixpacks), fallback to ffmpeg-static
+let ffmpegPath;
+try {
+  // Check if system FFmpeg is available (from nixpacks)
+  const { execSync } = require('child_process');
+  try {
+    execSync('which ffmpeg', { stdio: 'ignore' });
+    ffmpegPath = 'ffmpeg'; // Use system FFmpeg
+    console.log('Using system FFmpeg (from nixpacks)');
+  } catch (e) {
+    // System FFmpeg not available, use ffmpeg-static
+    const ffmpegStatic = require('ffmpeg-static');
+    ffmpegPath = ffmpegStatic;
+    console.log('Using ffmpeg-static (fallback)');
+  }
+} catch (error) {
+  // Fallback to ffmpeg-static if system FFmpeg check fails
+  const ffmpegStatic = require('ffmpeg-static');
+  ffmpegPath = ffmpegStatic;
+  console.log('Using ffmpeg-static (fallback)');
+}
 
 const PORT = process.env.PORT || 3000;
 const RTMPS_URL = process.env.RTMPS_URL;
@@ -295,7 +316,7 @@ async function startBrowserCapture(client) {
   
   // Start FFmpeg process to encode frames and stream
   console.log('Starting FFmpeg encoding process...');
-  console.log(`FFmpeg path: ${ffmpegStatic}`);
+  console.log(`FFmpeg path: ${ffmpegPath}`);
   console.log(`RTMPS URL: ${RTMPS_URL}`);
   
   // Optimized configuration for RTMPS streaming
@@ -333,9 +354,9 @@ async function startBrowserCapture(client) {
     RTMPS_URL
   ];
   
-  console.log('FFmpeg command:', ffmpegStatic, ffmpegArgs.join(' '));
+  console.log('FFmpeg command:', ffmpegPath, ffmpegArgs.join(' '));
   
-  captureProcess = spawn(ffmpegStatic, ffmpegArgs);
+  captureProcess = spawn(ffmpegPath, ffmpegArgs);
   
   // Handle stdin errors to prevent EPIPE crashes
   if (captureProcess.stdin) {
@@ -377,7 +398,12 @@ async function startBrowserCapture(client) {
     }
     captureState.isCapturing = false;
     streamStatus.active = false;
-    if (code !== 0 && code !== null) {
+    
+    if (signal === 'SIGSEGV') {
+      const errorMsg = 'FFmpeg crashed with SIGSEGV. This version of ffmpeg-static may not have proper RTMPS support compiled with OpenSSL. The build uses GnuTLS which can cause RTMPS connection issues.';
+      console.error(errorMsg);
+      streamStatus.error = errorMsg;
+    } else if (code !== 0 && code !== null) {
       streamStatus.error = `FFmpeg exited with code ${code}`;
     }
   });
@@ -500,9 +526,9 @@ function startStream(sourceUrl) {
     RTMPS_URL // Output URL
   ];
 
-  console.log('FFmpeg command: ' + ffmpegStatic + ' ' + ffmpegArgs.join(' '));
+  console.log('FFmpeg command: ' + ffmpegPath + ' ' + ffmpegArgs.join(' '));
   
-  currentStream = spawn(ffmpegStatic, ffmpegArgs);
+  currentStream = spawn(ffmpegPath, ffmpegArgs);
   
   // Handle FFmpeg output
   currentStream.stderr.on('data', (data) => {
