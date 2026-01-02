@@ -6,17 +6,13 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const RTMPS_URL = process.env.RTMPS_URL;
-const RTMP_URL = process.env.RTMP_URL; // Fallback to RTMP if RTMPS doesn't work
 const SOURCE_URL = process.env.SOURCE_URL;
 const WEB_PAGE_URL = process.env.WEB_PAGE_URL;
 const PLAY_BUTTON_SELECTOR = process.env.PLAY_BUTTON_SELECTOR || 'button[aria-label="Play"], button[aria-label="play"], button[aria-label*="play" i], .play-button, [class*="play"], button:has-text("Play")';
 const FPS = parseInt(process.env.FPS) || 3; // Default 3 FPS (between 1-5)
 
-// Determine which URL to use (RTMPS preferred, RTMP as fallback)
-const STREAM_URL = RTMPS_URL || RTMP_URL;
-
-if (!STREAM_URL) {
-  console.error('RTMPS_URL or RTMP_URL environment variable is required');
+if (!RTMPS_URL) {
+  console.error('RTMPS_URL environment variable is required');
   process.exit(1);
 }
 
@@ -96,7 +92,7 @@ app.get('/status', (req, res) => {
 });
 
 async function startWebPageStream(webPageUrl, playButtonSelector) {
-  console.log(`Starting web page stream from ${webPageUrl} to ${STREAM_URL} at ${FPS} FPS`);
+  console.log(`Starting web page stream from ${webPageUrl} to ${RTMPS_URL} at ${FPS} FPS`);
   console.log(`Looking for play button with selector: ${playButtonSelector}`);
   
   streamStatus.active = true;
@@ -300,17 +296,19 @@ async function startBrowserCapture(client) {
   // Start FFmpeg process to encode frames and stream
   console.log('Starting FFmpeg encoding process...');
   console.log(`FFmpeg path: ${ffmpegStatic}`);
-  console.log(`Stream URL: ${STREAM_URL}`);
+  console.log(`RTMPS URL: ${RTMPS_URL}`);
   
-  // For RTMPS, use simple approach - FFmpeg should handle RTMPS automatically
-  // If RTMPS doesn't work, the issue might be with the FFmpeg build
+  // Optimized configuration for RTMPS streaming
+  // Key changes: better format handling, proper RTMPS options
   const ffmpegArgs = [
     '-f', 'image2pipe',
     '-vcodec', 'mjpeg',
-    '-framerate', FPS.toString(), // Use framerate instead of -r for input
+    '-framerate', FPS.toString(),
     '-i', '-',
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=22050',
+    // Convert format properly - use swscale for better compatibility
+    '-vf', `format=yuv420p,scale=640:-1:flags=fast_bilinear,fps=${FPS}`,
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
@@ -321,16 +319,19 @@ async function startBrowserCapture(client) {
     '-b:v', '500k',
     '-maxrate', '500k',
     '-bufsize', '1000k',
-    '-r', FPS.toString(), // Output frame rate
-    '-vf', `scale=640:-1,fps=${FPS},format=yuv420p`,
+    '-r', FPS.toString(),
     '-c:a', 'aac',
     '-b:a', '64k',
     '-ar', '22050',
     '-ac', '2',
     '-f', 'flv',
     '-flvflags', 'no_duration_filesize',
-    '-protocol_whitelist', 'file,http,https,tcp,tls,rtmp,rtmps', // Whitelist RTMPS protocol
-    STREAM_URL
+    // RTMPS specific options
+    '-protocol_whitelist', 'file,http,https,tcp,tls,rtmp,rtmps',
+    '-rtmp_live', 'live',
+    '-rtmp_conn', 'O:1 NS:pub:stream',
+    '-loglevel', 'info', // Use info to see connection details
+    RTMPS_URL
   ];
   
   console.log('FFmpeg command:', ffmpegStatic, ffmpegArgs.join(' '));
@@ -382,15 +383,27 @@ async function startBrowserCapture(client) {
     }
   });
   
-  // Pipe frames to FFmpeg
+  // Wait a bit for FFmpeg to initialize and connect to RTMPS
+  console.log('Waiting for FFmpeg to initialize RTMPS connection...');
+  await wait(2000);
+  
+  // Pipe frames to FFmpeg with proper rate limiting
+  let framesSent = 0;
   const sendFrames = () => {
-    if (!captureState.isCapturing || !captureProcess || captureProcess.killed) return;
+    if (!captureState.isCapturing || !captureProcess || captureProcess.killed) {
+      return;
+    }
     
     if (frameBuffer.length > 0) {
       const frame = frameBuffer.shift();
       if (captureProcess.stdin && !captureProcess.stdin.destroyed) {
         try {
           const success = captureProcess.stdin.write(frame);
+          framesSent++;
+          if (framesSent % 10 === 0) {
+            console.log(`Sent ${framesSent} frames to FFmpeg`);
+          }
+          
           if (!success) {
             // Wait for drain if buffer is full
             captureProcess.stdin.once('drain', () => {
@@ -416,10 +429,9 @@ async function startBrowserCapture(client) {
     }
   };
   
-  // Start sending frames after a small delay to ensure FFmpeg is ready
-  setTimeout(() => {
-    sendFrames();
-  }, 500);
+  // Start sending frames
+  console.log('Starting to send frames to FFmpeg...');
+  sendFrames();
   
   // Try to capture audio from the page
   // Note: This is a workaround - real audio capture from browser requires more complex setup
@@ -453,7 +465,7 @@ async function startBrowserCapture(client) {
 }
 
 function startStream(sourceUrl) {
-  console.log(`Starting stream from ${sourceUrl} to ${STREAM_URL} at ${FPS} FPS`);
+  console.log(`Starting stream from ${sourceUrl} to ${RTMPS_URL} at ${FPS} FPS`);
   
   streamStatus.active = true;
   streamStatus.error = null;
@@ -482,9 +494,11 @@ function startStream(sourceUrl) {
     '-b:a', '64k', // Low audio bitrate
     '-ar', '22050', // Lower sample rate (lighter)
     '-ac', '2', // Stereo
-    '-f', 'flv', // FLV format for RTMPS/RTMP
+    '-f', 'flv', // FLV format for RTMPS
     '-flvflags', 'no_duration_filesize', // Optimize FLV
-    STREAM_URL // Output URL
+    '-protocol_whitelist', 'file,http,https,tcp,tls,rtmp,rtmps',
+    '-rtmp_live', 'live',
+    RTMPS_URL // Output URL
   ];
 
   console.log('FFmpeg command: ' + ffmpegStatic + ' ' + ffmpegArgs.join(' '));
@@ -593,7 +607,7 @@ if (WEB_PAGE_URL) {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Stream URL: ${STREAM_URL}`);
+  console.log(`RTMPS URL: ${RTMPS_URL}`);
   console.log(`Target FPS: ${FPS}`);
 });
 
